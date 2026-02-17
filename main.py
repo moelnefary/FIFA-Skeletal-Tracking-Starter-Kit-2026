@@ -1,11 +1,8 @@
 """
-FIFA Skeletal Tracking — Team Mil Solution
+This script provides a naive baseline for FIFA Skeletal Tracking Challenge.
 
-Upgrades over the baseline:
-  • Step 2: Global orientation compensation (R_corr) before camera rotation.
-  • Step 4: Tangent-space (se3 / Lie-algebra) reprojection optimisation.
-
-Author: Tianjian Jiang (baseline) — upgraded to Team Mil solution.
+Author: Tianjian Jiang
+Date: Nov 10, 2025
 """
 
 from pathlib import Path
@@ -21,18 +18,16 @@ from lib.postprocess import smoothen
 OPENPOSE_TO_OURS = [0, 2, 5, 3, 6, 4, 7, 9, 12, 10, 13, 11, 14, 22, 19]
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Geometry helpers
-# ═══════════════════════════════════════════════════════════════════════════
-
 def intersection_over_plane(o, d):
     """
     args:
         o: (3,) origin of the ray
         d: (3,) direction of the ray
+
     returns:
-        intersection: (3,) intersection point with z=0 plane
+        intersection: (3,) intersection point
     """
+    # solve the x and y where z = 0
     t = -o[2] / d[2]
     return o + t * d
 
@@ -41,100 +36,45 @@ def ray_from_xy(xy, K, R, t, k1=0.0, k2=0.0):
     """
     Compute the ray from the camera center through the image point (x, y),
     correcting for radial distortion using coefficients k1 and k2.
+
+    Args:
+        xy: (2,) array_like containing pixel coordinates [x, y] in the image.
+        K: (3, 3) ndarray representing the camera intrinsic matrix.
+        R: (3, 3) ndarray representing the camera rotation matrix.
+        t: (3,) ndarray representing the camera translation vector.
+        k1: float, the first radial distortion coefficient (default 0).
+        k2: float, the second radial distortion coefficient (default 0).
+
+    Returns:
+        origin: (3,) ndarray representing the camera center in world coordinates.
+        direction: (3,) unit ndarray representing the direction of the ray in world coordinates.
     """
+    # Convert the pixel coordinate to homogeneous coordinates.
     p = np.array([xy[0], xy[1], 1.0])
-    p_norm = np.linalg.inv(K) @ p
+
+    # Compute the normalized coordinate (distorted) in the camera coordinate system.
+    p_norm = np.linalg.inv(K) @ p  # p_norm = [x_d, y_d, 1]
     x_d, y_d = p_norm[0], p_norm[1]
 
+    # Compute the radial distance (squared) in the normalized plane.
     r2 = x_d**2 + y_d**2
+    # Compute the distortion factor.
     factor = 1 + k1 * r2 + k2 * (r2**2)
 
+    # Correct the distorted normalized coordinates.
     x_undist = x_d / factor
     y_undist = y_d / factor
 
+    # Construct the undistorted direction in camera coordinates (z = 1).
     d_cam = np.array([x_undist, y_undist, 1.0])
+
+    # Transform the direction to world coordinates.
     direction = R.T @ d_cam
     direction = direction / np.linalg.norm(direction)
 
+    # The camera center in world coordinates is given by -R^T t.
     origin = -R.T @ t
     return origin, direction
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Step 2: Global Orientation Compensation
-# ═══════════════════════════════════════════════════════════════════════════
-
-def compute_orientation_correction(box: np.ndarray, K: np.ndarray) -> np.ndarray:
-    """Compute a rotation matrix that corrects weak-perspective distortion.
-
-    Aligns the camera's optical axis A = [0, 0, 1] to the ray D that passes
-    through the centre of the player's 2D bounding box.
-
-    Args:
-        box: (4,) bounding box [x1, y1, x2, y2].
-        K:   (3, 3) camera intrinsic matrix.
-
-    Returns:
-        R_corr: (3, 3) correction rotation matrix.
-    """
-    # Centre of the bounding box in pixel coordinates
-    cx = (box[0] + box[2]) / 2.0
-    cy = (box[1] + box[3]) / 2.0
-
-    # Back-project to get the ray direction in camera coordinates
-    D = np.linalg.inv(K) @ np.array([cx, cy, 1.0])
-    D = D / np.linalg.norm(D)
-
-    # Optical axis
-    A = np.array([0.0, 0.0, 1.0])
-
-    # Rodrigues formula: compute rotation from A to D
-    v = np.cross(A, D)
-    s = np.linalg.norm(v)
-    c = np.dot(A, D)
-
-    if s < 1e-8:
-        # A and D are (anti-)parallel — no correction needed
-        return np.eye(3)
-
-    vx = np.array([
-        [0,    -v[2],  v[1]],
-        [v[2],  0,    -v[0]],
-        [-v[1], v[0],  0   ],
-    ])
-
-    R_corr = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
-    return R_corr
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Step 4: Tangent-Space (se3) Optimisation helpers
-# ═══════════════════════════════════════════════════════════════════════════
-
-def rodrigues_torch(omega: torch.Tensor) -> torch.Tensor:
-    """Batch Rodrigues formula: rotation vector → rotation matrix.
-
-    Args:
-        omega: (N, 3) rotation vectors.
-
-    Returns:
-        R: (N, 3, 3) rotation matrices.
-    """
-    theta = torch.norm(omega, dim=-1, keepdim=True).unsqueeze(-1)  # (N, 1, 1)
-    omega_n = omega / (theta.squeeze(-1) + 1e-8)                  # (N, 3)
-
-    # Skew-symmetric matrix
-    zero = torch.zeros_like(omega_n[:, 0])
-    K = torch.stack([
-        zero,          -omega_n[:, 2],  omega_n[:, 1],
-        omega_n[:, 2],  zero,          -omega_n[:, 0],
-        -omega_n[:, 1], omega_n[:, 0],  zero,
-    ], dim=-1).reshape(-1, 3, 3)
-
-    # Rodrigues: R = I + sin(θ) K + (1 - cos(θ)) K²
-    I = torch.eye(3, device=omega.device, dtype=omega.dtype).unsqueeze(0)
-    R = I + torch.sin(theta) * K + (1 - torch.cos(theta)) * (K @ K)
-    return R
 
 
 def project_points_th(obj_pts, R, C, K, k):
@@ -142,90 +82,79 @@ def project_points_th(obj_pts, R, C, K, k):
 
     args:
         obj_pts: (N, 3) - 3D points in world space
-        R: (3, 3) or (N, 3, 3) - Rotation matrix
-        C: (3,) or (N, 3) - Camera center
-        K: (3, 3) or (N, 3, 3) - Camera intrinsic matrix
-        k: (2,) or (N, 2) - Distortion coefficients
+        R: (3, 3) - Rotation matrix
+        C: (3,) - Camera center
+        K: (3, 3) - Camera intrinsic matrix
+        k: (5,) - Distortion coefficients
 
     returns:
         img_pts: (N, 2) - Projected 2D points
     """
+
+    # Transform world points to camera coordinates
     pts_c = (R @ ((obj_pts - C).unsqueeze(-1))).squeeze(-1)
+
+    # Normalize to get image plane coordinates
     img_pts = pts_c[:, :2] / pts_c[:, 2:]
 
+    # Compute radial distortion
     r2 = (img_pts**2).sum(dim=-1, keepdim=True)
     r2 = torch.clamp(r2, 0, 0.5 / min(max(torch.abs(k).max().item(), 1.0), 1.0))
     p = torch.arange(1, k.shape[-1] + 1, device=k.device)
     img_pts = img_pts * (torch.ones_like(r2) + (k * r2.pow(p)).sum(-1, keepdim=True))
 
-    img_pts_h = torch.cat([img_pts, torch.ones_like(img_pts[:, :1])], dim=-1)
-    img_pts = (K @ img_pts_h.unsqueeze(-1)).squeeze(-1)[:, :2]
+    # Apply intrinsics K
+    img_pts_h = torch.cat([img_pts, torch.ones_like(img_pts[:, :1])], dim=-1)  # Homogeneous coords
+    img_pts = (K @ img_pts_h.unsqueeze(-1)).squeeze(-1)[:, :2]  # Convert back to 2D
+
     return img_pts
 
 
 def minimize_reprojection_error(pts_3d, pts_2d, R, C, K, k, iterations=10):
-    """Optimise camera pose in tangent space (se3 / Lie algebra).
-
-    Optimises a 6D twist ξ = [ω (3), δt (3)] per sample so that:
-        R_new = R_current @ exp(ω)      (rotation update via Rodrigues)
-        t_new = t_current + δt           (translation update)
-    minimising the MSE between projected 3D hip joints and 2D detections.
-
-    Args:
-        pts_3d: (N, 3)   Initial 3D points.
-        pts_2d: (N, 2)   Corresponding 2D detections.
-        R:      (N, 3, 3) Rotation matrices (fixed reference).
-        C:      (N, 3)    Camera centres (fixed reference).
-        K:      (N, 3, 3) Intrinsic matrices.
-        k:      (N, 2)    Distortion coefficients.
-        iterations: int   Number of L-BFGS steps.
-
-    Returns:
-        omega:  (N, 3)  Optimised rotation deltas (as rotation vectors).
-        delta_t: (N, 3) Optimised translation deltas.
     """
-    N = pts_3d.shape[0]
-    device = pts_3d.device
-    dtype = pts_3d.dtype
+    Optimize 3D points to minimize reprojection error.
 
-    # Learnable se3 parameters: rotation vector ω and translation δt
-    omega = torch.nn.Parameter(torch.zeros(N, 3, device=device, dtype=dtype))
-    delta_t = torch.nn.Parameter(torch.zeros(N, 3, device=device, dtype=dtype))
+    args:
+        pts_3d: (N, 3)  - Initial 3D points (learnable)
+        pts_2d: (N, 2)  - Corresponding 2D points
+        R: (N, 3, 3)    - Rotation matrix (fixed)
+        C: (N, 3)       - Camera center (fixed)
+        K: (N, 3, 3)    - Camera intrinsic matrix (fixed)
+        k: (N, 2,)      - Distortion coefficients (fixed)
+        iterations: int - Number of optimization steps
 
-    # Bounds for clamping
-    omega_bound = 0.1   # ~5.7 degrees max rotation update
-    t_bound = torch.tensor([3.0, 3.0, 0.2], device=device, dtype=dtype)
+    returns:
+        t: (N, 3) - Optimized translation
+    """
+    # Convert 3D points to learnable parameters
+    # pts_3d = torch.nn.Parameter(pts_3d.clone().detach().requires_grad_(True))
+    t = torch.nn.Parameter(torch.zeros_like(pts_3d).clone().detach().requires_grad_(True))
+    offset = torch.tensor([3, 3, 0.2], dtype=pts_3d.dtype, device=pts_3d.device)
+    lower_bounds = t - offset
+    upper_bounds = t + offset
 
+    # check if there are any NaN values
     assert not torch.isnan(pts_3d).any()
     assert not torch.isnan(pts_2d).any()
 
     def closure():
         optimizer.zero_grad()
-
-        # Compute updated rotation: R_new = R_current @ exp(ω)
-        dR = rodrigues_torch(omega)          # (N, 3, 3)
-        R_new = R @ dR                       # (N, 3, 3)
-
-        # Updated camera centre: C_new = C + δt
-        C_new = C + delta_t
-
-        projected = project_points_th(pts_3d, R_new, C_new, K, k)
-        loss = torch.nn.functional.mse_loss(projected, pts_2d)
+        projected_pts = project_points_th(pts_3d + t, R, C, K, k)
+        loss = torch.nn.functional.mse_loss(projected_pts, pts_2d)
         loss.backward()
         return loss
 
-    optimizer = optim.LBFGS([omega, delta_t], line_search_fn="strong_wolfe")
+    optimizer = optim.LBFGS([t], line_search_fn="strong_wolfe")
     for _ in range(iterations):
         optimizer.step(closure)
         with torch.no_grad():
-            omega.clamp_(-omega_bound, omega_bound)
-            delta_t.copy_(torch.clamp(delta_t, -t_bound, t_bound))
+            t.copy_(torch.clamp(t, lower_bounds, upper_bounds))
 
-    return omega.detach(), delta_t.detach()
+    return t.detach()
 
 
 def fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes):
-    """Wrapper to fine-tune the 3D predictions using tangent-space optimisation."""
+    """wrapper function to fine-tune the translation of the 3D predictions to minimize reprojection error"""
     NUM_PERSONS = predictions.shape[0]
     mid_hip_3d = predictions[..., [7, 8], :].mean(axis=-2, keepdims=False)
     mid_hip_2d = skels_2d[..., [7, 8], :].mean(axis=-2, keepdims=False).transpose(1, 0, 2)
@@ -241,8 +170,7 @@ def fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes):
         "k": cameras["k"][None, ..., :2].repeat(NUM_PERSONS, axis=0),
     }
     valid = ~np.isnan(boxes).any(axis=-1).transpose(1, 0)
-
-    omega, delta_t = minimize_reprojection_error(
+    traj_3d = minimize_reprojection_error(
         pts_3d=torch.tensor(mid_hip_3d[valid], dtype=torch.float32).to("cuda"),
         pts_2d=torch.tensor(mid_hip_2d[valid], dtype=torch.float32).to("cuda"),
         R=torch.tensor(camera_params["R"][valid], dtype=torch.float32).to("cuda"),
@@ -250,12 +178,8 @@ def fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes):
         K=torch.tensor(camera_params["K"][valid], dtype=torch.float32).to("cuda"),
         k=torch.tensor(camera_params["k"][valid], dtype=torch.float32).to("cuda"),
     )
-    return omega, delta_t, valid
+    return traj_3d, valid
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Main processing pipeline
-# ═══════════════════════════════════════════════════════════════════════════
 
 def process_sequence(
     boxes: np.ndarray,
@@ -265,12 +189,10 @@ def process_sequence(
     video_path: Path | str,
     tracker_options: CameraTrackerOptions,
 ) -> np.ndarray:
-    """Process one video sequence.
-
-    1. Estimate/track camera pose per frame (PnP-based tracker).
-    2. For each person, apply global orientation compensation (R_corr)
-       then camera extrinsics to lift 3D skeletons into world space.
-    3. Fine-tune via tangent-space reprojection optimisation.
+    """a naive baseline that uses the bounding boxes to estimate the camera pose
+    1. estimate the camera pose using the bounding boxes
+    2. periodically refine the camera pose using lane lines
+    3. project the 3D skeletons to the 2D image plane and optimize the translation to minimize reprojection error
     """
     NUM_FRAMES, NUM_PERSONS, _ = boxes.shape
     predictions = np.zeros((NUM_PERSONS, NUM_FRAMES, 15, 3))
@@ -309,6 +231,7 @@ def process_sequence(
         Rt.append((state.R.copy(), state.t.copy()))
 
         for person in range(NUM_PERSONS):
+            # decide which foot is in contact with the ground by checking which has lower y
             box = boxes[frame_idx, person]
             if np.isnan(box).any():
                 continue
@@ -323,32 +246,30 @@ def process_sequence(
             o, d = ray_from_xy((x, y), K, R, t, k[0], k[1])
             intersection = intersection_over_plane(o, d)
 
-            # ── Step 2: Global orientation compensation ──────────────
-            R_corr = compute_orientation_correction(box, K)
-
+            # convert from camera space to world space
             skel_3d = skels_3d[frame_idx, person]
-            skel_3d = (skel_3d @ R_corr) @ R          # corrected rotation
+            skel_3d = skel_3d @ R
             skel_3d = skel_3d - skel_3d[IDX] + intersection
             predictions[person, frame_idx] = skel_3d
 
-    # ── Step 4: Tangent-space fine-tuning ────────────────────────────────
-    omega, delta_t, valid = fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes)
+        # Draw skeletons on visualization
+        if camera_tracker.debug_vis.visualize:
+            camera_tracker.debug_vis.draw_skeletons(
+                skels_2d=skels_2d[frame_idx],
+                boxes=boxes[frame_idx],
+            )
+            cv2.imshow("Visualization", camera_tracker.debug_vis.frame_curr)
+            key = cv2.waitKey(1)
+            if key == ord("q"):
+                exit()
 
-    # Apply the optimised rotation and translation deltas
-    dR = rodrigues_torch(omega).cpu().numpy()           # (M, 3, 3)
-    dt_np = delta_t.cpu().numpy()                       # (M, 3)
-
-    # Rotate each skeleton by dR and shift by δt
-    preds_valid = predictions[valid]                    # (M, 15, 3)
-    for i in range(len(preds_valid)):
-        preds_valid[i] = preds_valid[i] @ dR[i].T      # apply rotation delta
-    preds_valid = preds_valid + dt_np[:, None, :]       # apply translation delta
-    predictions[valid] = preds_valid
-
+    # fine-tune the translation to minimize reprojection error
+    traj_3d, valid = fine_tune_translation(predictions, skels_2d, cameras, Rt, boxes)
+    predictions[valid] = predictions[valid] + traj_3d.cpu().numpy()[:, None, :]
     for person in range(NUM_PERSONS):
         predictions[person] = smoothen(predictions[person])
-
-    # Update camera parameters
+    
+    # update the camera parameters
     cameras["R"] = np.array([k[0] for k in Rt], dtype=np.float32)
     cameras["t"] = np.array([k[1] for k in Rt], dtype=np.float32)
     return predictions.astype(np.float32)
